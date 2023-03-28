@@ -2,12 +2,12 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	dockerClient "github.com/docker/docker/client"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -19,28 +19,34 @@ type containerInfo struct {
 }
 
 type voyagerSettings struct {
-	DomainName     string
+	DomainName     []string
 	DomainTls      bool
-	ServicePort    int
+	ServiceIp      string
+	ServicePort    string
 	ServiceTls     bool
 	ServiceHeaders map[string][]string
 }
 
 type Worker struct {
-	ctx           context.Context
-	client        dockerClient.Client
-	containerInfo map[string]containerInfo // map of container id => info
-	networkInfo   map[string][]string      // map of network id => list of container ids
+	ctx    context.Context
+	client dockerClient.Client
+
+	traefikContainerId string
+	traefikConfigFile  string
+	containerInfo      map[string]containerInfo // map of container id => info
+	networkInfo        map[string][]string      // map of network id => list of container ids
 
 	cancel func()
 }
 
-func New(ctx context.Context, cancel func()) (*Worker, error) {
+func New(containerId string, traefikConfigFile string, ctx context.Context, cancel func()) (*Worker, error) {
 	return &Worker{
-		ctx:           ctx,
-		cancel:        cancel,
-		containerInfo: make(map[string]containerInfo),
-		networkInfo:   make(map[string][]string),
+		ctx:                ctx,
+		cancel:             cancel,
+		traefikContainerId: containerId,
+		traefikConfigFile:  traefikConfigFile,
+		containerInfo:      make(map[string]containerInfo),
+		networkInfo:        make(map[string][]string),
 	}, nil
 }
 
@@ -65,6 +71,8 @@ func (w *Worker) Start() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	w.writeTraefikConfig()
+
 	eventFilters := filters.NewArgs()
 	eventFilters.Add("type", "container")
 	eventFilters.Add("label", "voyager.domain.name")
@@ -78,10 +86,14 @@ func (w *Worker) Start() {
 			panic(err)
 		case msg := <-dockerMessages:
 			w.updateContainerInfo(msg.Actor.ID, msg.Action == "destroy")
+			w.updateNetworkInfo()
+			w.updateContainerNetworks()
 			w.writeTraefikConfig()
 		case <-ticker.C:
-			// TODO: Enable ticker
-			// w.tickerDoWork()
+			w.tickerDoWork()
+			w.updateNetworkInfo()
+			w.updateContainerNetworks()
+			w.writeTraefikConfig()
 		case <-w.ctx.Done():
 			return
 		}
@@ -89,6 +101,9 @@ func (w *Worker) Start() {
 }
 
 func (w *Worker) Stop() error {
+	w.containerInfo = map[string]containerInfo{}
+	w.updateNetworkInfo()
+	w.updateContainerNetworks()
 	w.cancel()
 	return nil
 }
@@ -108,8 +123,6 @@ func (w *Worker) tickerDoWork() {
 }
 
 func (w *Worker) updateContainerInfo(containerId string, removed bool) {
-	defer w.updateNetworkInfo()
-
 	if removed {
 		delete(w.containerInfo, containerId)
 		return
@@ -123,14 +136,30 @@ func (w *Worker) updateContainerInfo(containerId string, removed bool) {
 	for _, item := range containerInfoJson.NetworkSettings.Networks {
 		networkIdList = append(networkIdList, item.NetworkID)
 	}
-	w.containerInfo[containerInfoJson.ID] = containerInfo{
-		Id:              containerInfoJson.ID,
-		Name:            containerInfoJson.Name,
-		NetworkId:       networkIdList,
-		VoyagerSettings: voyagerSettings{}, // TODO: Generate VoyagerSettings
+	servicePort := "80"
+	for k := range containerInfoJson.Config.ExposedPorts {
+		if !strings.HasSuffix(string(k), "/tcp") {
+			continue
+		}
+		servicePort = strings.TrimSuffix(string(k), "/tcp")
 	}
-	b, _ := json.MarshalIndent(containerInfoJson, "", "  ")
-	fmt.Printf("containerInfo: %s\n", b)
+	if val, ok := containerInfoJson.Config.Labels["voyager.service.port"]; ok {
+		servicePort = strings.TrimSuffix(val, "/tcp")
+	}
+	serviceHeaders := map[string][]string{}
+	w.containerInfo[containerInfoJson.ID] = containerInfo{
+		Id:        containerInfoJson.ID,
+		Name:      containerInfoJson.Name,
+		NetworkId: networkIdList,
+		VoyagerSettings: voyagerSettings{
+			DomainName:     strings.Split(containerInfoJson.Config.Labels["voyager.domain.name"], ","),
+			DomainTls:      containerInfoJson.Config.Labels["voyager.domain.tls"] == "true",
+			ServiceIp:      containerInfoJson.NetworkSettings.IPAddress,
+			ServicePort:    servicePort,
+			ServiceTls:     containerInfoJson.Config.Labels["voyager.service.tls"] == "true",
+			ServiceHeaders: serviceHeaders,
+		},
+	}
 }
 
 func (w *Worker) updateNetworkInfo() {
@@ -146,8 +175,49 @@ func (w *Worker) updateNetworkInfo() {
 	}
 }
 
-func (w *Worker) writeTraefikConfig() {
-	// TODO: Write traefik file provider dynamic config marshalled as yaml file
-	fmt.Printf("containerInfo: %+v\n", w.containerInfo)
-	fmt.Printf("networkInfo:   %+v\n", w.networkInfo)
+func (w *Worker) updateContainerNetworks() {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Print(err)
+		}
+	}()
+	if w.traefikContainerId == "" {
+		return
+	}
+
+	containerInfoJson, err := w.client.ContainerInspect(w.ctx, w.traefikContainerId)
+	if err != nil {
+		panic(err)
+	}
+
+OuterRemove:
+	for _, existingNetwork := range containerInfoJson.NetworkSettings.Networks {
+		if existingNetwork.EndpointID == containerInfoJson.NetworkSettings.EndpointID {
+			continue
+		}
+		for expectedNetworkId := range w.networkInfo {
+			if existingNetwork.NetworkID == expectedNetworkId {
+				continue OuterRemove
+			}
+		}
+
+		err := w.client.NetworkDisconnect(w.ctx, existingNetwork.NetworkID, containerInfoJson.ID, true)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+OuterAdd:
+	for expectedNetworkId := range w.networkInfo {
+		for _, existingNetwork := range containerInfoJson.NetworkSettings.Networks {
+			if existingNetwork.NetworkID == expectedNetworkId {
+				continue OuterAdd
+			}
+		}
+
+		err := w.client.NetworkConnect(w.ctx, expectedNetworkId, containerInfoJson.ID, of(network.EndpointSettings{}))
+		if err != nil {
+			panic(err)
+		}
+	}
 }

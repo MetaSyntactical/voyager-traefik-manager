@@ -3,9 +3,14 @@ package cmd
 import (
 	"context"
 	"github.com/MetaSyntactical/voyager-traefik-manager/worker"
-	"os"
-
 	"github.com/spf13/cobra"
+	"os"
+	"os/signal"
+)
+
+var (
+	containerId       string
+	traefikConfigFile string
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -24,16 +29,22 @@ to quickly create a Cobra application.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx, cancel := context.WithCancel(context.Background())
 
-		w, err := worker.New(ctx, cancel)
-		defer func(w *worker.Worker) {
-			err := w.Stop()
-			if err != nil {
-				panic(err)
-			}
-		}(w)
+		w, err := worker.New(containerId, traefikConfigFile, ctx, cancel)
 		if err != nil {
 			panic(err)
 		}
+
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		go func() {
+			select {
+			case <-c:
+				err := w.Stop()
+				if err != nil {
+					panic(err)
+				}
+			}
+		}()
 
 		w.Start()
 	},
@@ -59,4 +70,6 @@ func init() {
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
 	// rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	rootCmd.Flags().StringVar(&containerId, "containerId", "", "id of the current container")
+	rootCmd.Flags().StringVar(&traefikConfigFile, "traefikConfig", "", "path to traefik config file, if empty - stdout")
 }

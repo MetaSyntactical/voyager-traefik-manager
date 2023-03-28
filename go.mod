@@ -4,7 +4,9 @@ go 1.19
 
 require (
 	github.com/docker/docker v23.0.1+incompatible
+	github.com/ghodss/yaml v1.0.0
 	github.com/spf13/cobra v1.6.1
+	github.com/traefik/genconf v0.3.0
 )
 
 require (
@@ -26,5 +28,6 @@ require (
 	golang.org/x/sys v0.1.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	golang.org/x/tools v0.1.12 // indirect
+	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gotest.tools/v3 v3.4.0 // indirect
 )
